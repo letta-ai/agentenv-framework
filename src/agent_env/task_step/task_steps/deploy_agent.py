@@ -479,6 +479,13 @@ class DeployAgentTaskStep(TaskStep):
             card.update(identity.fields)
             logger.info(f"Stamped card identity on '{self.agent_name}': {sorted(identity.fields)}")
 
+        # Per-agent extension config uses the same secret references as model credentials.
+        configured = config.get_agent_config(self.agent_name)
+        if configured:
+            negotiated = A2AAgent.negotiate_agent_config(card, configured)
+            if negotiated:
+                await protocol.post_agent_config(a2a_url + negotiated.endpoint, negotiated.fields)
+
         default_model = config.get_model_for_role("agent")
         if default_model and not context.default_agent_model:
             context.default_agent_model = default_model

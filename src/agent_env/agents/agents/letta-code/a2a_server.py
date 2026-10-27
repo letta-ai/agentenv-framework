@@ -54,6 +54,7 @@ from agentenv_protocol.a2a_agent import (
     TaskResult,
     TextPart,
     Usage,
+    WriteOnly,
     a2a_agent,
     download,
     enable,
@@ -130,6 +131,8 @@ def _changelog_backup_exclusions() -> list[str]:
 
 
 class LettaCodeConfig(AgentConfig):
+    letta_api_key: WriteOnly[str | None] = None
+    letta_base_url: str = "https://api.letta.com"
     model: str | None = None
     effort: str | None = None
     system_prompt: str | None = None
@@ -342,6 +345,8 @@ class LettaCodeAgent(DurableSessionRefs, AgentEnvAgent):
                     context_id=context_id,
                     session_id=session_id,
                     model=request.config.model,
+                    letta_api_key=request.config.letta_api_key,
+                    letta_base_url=request.config.letta_base_url,
                     effort=request.config.effort,
                     mcp_servers=dict(request.mcp_servers),
                     system_prompt=request.config.system_prompt,
