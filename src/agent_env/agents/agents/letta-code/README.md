@@ -14,16 +14,17 @@ The bridge connects the local backend with `letta connect openai-compatible`. A 
 requests to `$LITELLM_BASE_URL/v1`, with `LITELLM_API_KEY`, `[model.headers]` (`LITELLM_EXTRA_HEADERS`), and
 `project_id` / `task_id` as `x-litellm-customer-id` and `x-litellm-tags`. The model defaults to
 `openai/gpt-4.1-mini`. Endpoint credentials stay at the relay. Registered MCP servers retain their names and headers;
-a task role replaces `AgentEnv-Role`. Task instructions explain discovery and the full `mcp__<server>__<tool>`
-call form for the CLI's MCP tools, including peer tools.
+a task role replaces `AgentEnv-Role`. Before each turn, `letta mcp tools --full` discovers the exact schemas. A context-local mod registers them as
+direct Letta Code tools through `letta.tools.register`; each tool executes `letta mcp call` with its full
+`mcp__<server>__<tool>` name. Peer tools use the same path.
 
 | Extension | Implementation |
 |---|---|
 | `agent-config/v1` | SDK set/get; `model`, `effort`, `system_prompt`, `output_format`, `project_id`, `task_id`, `timeout_seconds`. Before every turn, task instructions are committed to the existing agent's core memory, which the local backend compiles into its system prompt. JSON schema answers are validated locally. |
-| `mcp-config/v1` | SDK registration and listing; servers passed to the context's agent settings each turn, with exact-name discovery instructions. |
+| `mcp-config/v1` | SDK registration and listing; servers passed to the context's agent settings each turn, with their discovered schemas exposed as direct tools through the public mods API. |
 | `skill-config/v1` | Inline and bundle skills installed under `$HOME/.letta/skills/`, copied into each context's home before its turn. |
 | `trajectory/v1` | Native stream-json events appended live, format `letta-code-events/1`. |
-| `snapshot/v1` | Save archives the complete context home, including conversations, agent records, settings and git-backed memory; load stages it and restores it into the target context, rewriting stored home paths and binding the saved conversation. Optional workspace archives restore `/app`. GNU tar changelog captures task-level file increments, including removed roots, using the OpenCode template's implementation. |
+| `snapshot/v1` | Save archives the complete context home, including conversations, agent records, settings and git-backed memory; load stages it and restores it into the target context, rewriting stored home paths and binding the saved conversation. Optional workspace archives restore `/app`. The validator reports load/recall as false without its optional Claude Code rubric judge, as it does for the OpenCode baseline; a live cross-context recall probe verifies restore independently. GNU tar changelog captures task-level file increments, including removed roots, using the OpenCode template's implementation. |
 | `peer-agents/v1` | SDK default; its `peer_agents` MCP server is registered alongside task servers. |
 | `attribution-probe/v1` | Reports the project and task attribution used by the last CLI turn. |
 | `install/v1` | Template installer brings checksum-verified Node and uv, the pinned CLI, and a private Python into a container or a Linux host with glibc. Installs git if missing. |

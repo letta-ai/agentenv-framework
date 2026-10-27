@@ -286,9 +286,11 @@ async def model_relay(headers: dict[str, str]):
                     if name.lower() not in {"content-length", "transfer-encoding", "connection"}
                 })
                 await response.prepare(request)
-                async for chunk in upstream.content.iter_any():
-                    await response.write(chunk)
-                await response.write_eof()
+                # SSE consumers commonly close immediately after the terminal event.
+                with contextlib.suppress(ConnectionResetError):
+                    async for chunk in upstream.content.iter_any():
+                        await response.write(chunk)
+                    await response.write_eof()
                 return response
         app = web.Application(client_max_size=100 * 1024**2)
         app.router.add_route("*", "/{path:.*}", forward)
@@ -316,11 +318,8 @@ def _configure_agent(home: Path, agent_id: str, servers: dict, role: str | None,
     memory.mkdir(parents=True, exist_ok=True)
     instructions = system_prompt or ""
     if servers:
-        instructions += ("\nMCP tools are available through the Letta CLI. Before calling any MCP tool, run "
-                         "`letta mcp tools --full --agent " + agent_id + "` to discover exact names and schemas. "
-                         "Use the full mcp__<server>__<tool> name returned by discovery, never a bare tool name. "
-                         "Call `letta mcp call <full-name> --agent " + agent_id + " --args '<JSON>'`. "
-                         "Use these tools to act on connected services and peer agents.\n")
+        instructions += ("\nUse the connected MCP tools directly for services and peer agents. "
+                         "They are named mcp__<server>__<tool>. These services require no repository setup.\n")
     target = "task_instructions.md" if (memory / "MEMORY.md").exists() else "system/task_instructions.md"
     path = memory / target
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,6 +345,14 @@ def _configure_agent(home: Path, agent_id: str, servers: dict, role: str | None,
         ]
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings))
+
+
+def _install_mcp_tools(home: Path, agent_id: str, tools: list[dict]) -> None:
+    """A context-local mod registers the CLI-discovered schemas without renaming their tools."""
+    directory = home / ".letta"
+    (directory / "mods").mkdir(parents=True, exist_ok=True)
+    (directory / "agentenv-mcp-tools.json").write_text(json.dumps({"agentId": agent_id, "tools": tools}))
+    shutil.copyfile(Path(__file__).with_name("mcp_tools.ts"), directory / "mods/agentenv-mcp.ts")
 
 
 async def run_letta_code(
@@ -383,6 +390,8 @@ async def _turn(prompt, context_id, session_id, model, mcp_servers, system_promp
             agent_id = agent["id"]
             agent_file.write_text(json.dumps({"id": agent_id}))
         _configure_agent(home, agent_id, mcp_servers or {}, role, system_prompt)
+        tools = json.loads(await _command(env, "mcp", "tools", "--full", "--agent", agent_id)) if mcp_servers else []
+        _install_mcp_tools(home, agent_id, tools)
         skills = Path(os.environ.get("HOME", "/data")) / ".letta/skills"
         if skills.exists():
             shutil.copytree(skills, home / ".letta/skills", dirs_exist_ok=True)

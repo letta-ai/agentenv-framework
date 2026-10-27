@@ -24,10 +24,11 @@ RUN npm ci --ignore-scripts --omit=dev --no-audit --no-fund --loglevel=error \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 # install.sh and run.sh are install/v1's: in the image, so they stay in its build context.
-COPY a2a_server.py letta_code_bridge.py letta_code_kit.py entrypoint.sh install.sh run.sh ./
+COPY mcp_tools.ts a2a_server.py letta_code_bridge.py letta_code_kit.py entrypoint.sh install.sh run.sh ./
 # The CLI's cwd, /app, and its state under /data, fixed so neither follows the uid: Modal runs the image as root.
 RUN useradd --create-home --uid 10001 agent && mkdir -p /app /data \
-    && chown agent:agent /app /data && chmod 0755 entrypoint.sh && chmod -R go+rX /opt/agent
+    && chown agent:agent /app /data && chmod 0755 entrypoint.sh \
+    && find /opt/agent \( ! -perm -044 -o \( -perm /111 ! -perm -011 \) \) -exec chmod go+rX {} +
 ENV A2A_PORT=8000 PYTHONPATH=/opt/agent HOME=/data XDG_CONFIG_HOME=/data/config XDG_CACHE_HOME=/data/cache \
     XDG_DATA_HOME=/data/share XDG_STATE_HOME=/data/state
 USER agent

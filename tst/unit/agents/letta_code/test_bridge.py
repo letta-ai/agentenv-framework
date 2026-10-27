@@ -72,7 +72,8 @@ def test_native_events_track_conversation_tools_and_stderr():
 
 
 @pytest.mark.asyncio
-async def test_cancel_kills_the_turn_process(monkeypatch, tmp_path):
+@pytest.mark.parametrize("session_id", [None, "local-conv-7"])
+async def test_cancel_kills_the_turn_process(monkeypatch, tmp_path, session_id):
     monkeypatch.setattr(bridge, "SESSIONS_ROOT", str(tmp_path / "sessions"))
     agent = a2a_server.LettaCodeAgent()
     app = a2a_server.build_app(agent)
@@ -102,15 +103,30 @@ async def test_cancel_kills_the_turn_process(monkeypatch, tmp_path):
     monkeypatch.setattr(bridge, "model_relay", relay)
 
     async def spawn(*args, **kwargs):
+        if session_id:
+            assert "--conversation" in args and "--agent" not in args
+        else:
+            assert "--agent" in args and "--new" in args
         return Proc()
 
     monkeypatch.setattr(bridge, "_command", command)
     monkeypatch.setattr(bridge, "_configure_agent", lambda *args: None)
     monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(bridge, "_stream_cli", stream)
-    turn = asyncio.create_task(bridge.run_letta_code("wait", "ctx", workspace=str(tmp_path)))
+    turn = asyncio.create_task(bridge.run_letta_code("wait", "ctx", session_id=session_id, workspace=str(tmp_path)))
     await asyncio.wait_for(started.wait(), 5)
     turn.cancel()
     with pytest.raises(asyncio.CancelledError):
         await turn
     assert stopped.is_set() and not bridge._RUNNING
+
+
+def test_direct_mcp_catalog_replaces_previous_context_tools(tmp_path):
+    bridge._install_mcp_tools(tmp_path, "agent-local-1", [{
+        "name": "mcp__mail__search_emails", "description": "Search mail", "inputSchema": {"type": "object"},
+    }])
+    catalog = tmp_path / ".letta/agentenv-mcp-tools.json"
+    assert json.loads(catalog.read_text())["tools"][0]["name"] == "mcp__mail__search_emails"
+    assert (tmp_path / ".letta/mods/agentenv-mcp.ts").exists()
+    bridge._install_mcp_tools(tmp_path, "agent-local-1", [])
+    assert json.loads(catalog.read_text())["tools"] == []
