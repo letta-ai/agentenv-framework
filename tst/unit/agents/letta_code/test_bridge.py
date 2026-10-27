@@ -227,3 +227,25 @@ async def test_attribution_is_recorded_only_when_the_relay_forwards(monkeypatch)
     seen[0]()
     snapshot = bridge.get_last_attribution_snapshot()
     assert snapshot["project_id"] == "p1" and snapshot["task_id"] == "t1"
+
+
+def test_cleanup_failure_after_a_successful_swap_keeps_the_new_conversation(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "SESSIONS_ROOT", str(tmp_path / "sessions"))
+    target = bridge.context_data_dir("target")
+    target.mkdir(parents=True)
+    (target / "conversation.json").write_text("previous")
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "conversation.json").write_text("restored")
+    real_rmtree = bridge.shutil.rmtree
+
+    def rmtree(path, ignore_errors=False, **kwargs):
+        if str(path).endswith(".previous") and not ignore_errors:
+            raise PermissionError("old tree is read-only")
+        if str(path).endswith(".previous"):
+            return None
+        return real_rmtree(path, ignore_errors=ignore_errors, **kwargs)
+
+    monkeypatch.setattr(bridge.shutil, "rmtree", rmtree)
+    bridge.commit_staged_session("target", staged)
+    assert (target / "conversation.json").read_text() == "restored"

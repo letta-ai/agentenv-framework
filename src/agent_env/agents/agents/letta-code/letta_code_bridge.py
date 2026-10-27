@@ -126,8 +126,7 @@ def commit_staged_session(context_id: str, staged: Path) -> None:
     root = context_data_dir(context_id)
     root.parent.mkdir(parents=True, exist_ok=True)
     previous = root.with_name(root.name + ".previous")
-    if previous.exists():
-        shutil.rmtree(previous)
+    shutil.rmtree(previous, ignore_errors=True)
     if root.exists():
         root.rename(previous)
     try:
@@ -138,8 +137,8 @@ def commit_staged_session(context_id: str, staged: Path) -> None:
         if previous.exists():
             previous.rename(root)
         raise
-    if previous.exists():
-        shutil.rmtree(previous)
+    # The swap has succeeded; removing the old tree is cleanup and must not undo it.
+    shutil.rmtree(previous, ignore_errors=True)
 
 
 async def import_session(context_id: str, json_path: str) -> str:
