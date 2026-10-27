@@ -1,4 +1,4 @@
-"""Letta Code bridge with local context state or persistent cloud agents."""
+"""Letta Code local-backend bridge, with isolated context state and a per-turn model relay."""
 from __future__ import annotations
 
 import asyncio
@@ -52,17 +52,11 @@ def context_data_dir(context_id: str) -> Path:
     return Path(SESSIONS_ROOT) / ctx_hash
 
 
-def _context_env(context_id: str, api_key: str | None = None, base_url: str = "https://api.letta.com") -> dict[str, str]:
+def _context_env(context_id: str) -> dict[str, str]:
     home = context_data_dir(context_id)
     home.mkdir(parents=True, exist_ok=True)
-    environ = {key: value for key, value in os.environ.items()
-               if not key.startswith("LETTA_")}
-    if api_key:
-        environ.update(LETTA_API_KEY=api_key, LETTA_BASE_URL=base_url, LETTA_BACKEND="api")
-    else:
-        environ["LETTA_BACKEND"] = "local"
-    return {**environ, "HOME": str(home), "LETTA_LOCAL_BACKEND_DIR": str(home / ".letta/lc-local-backend"),
-            "LETTA_LOCAL_BACKEND_EXPERIMENTAL": "0" if api_key else "1"}
+    return {**os.environ, "HOME": str(home), "LETTA_LOCAL_BACKEND_DIR": str(home / ".letta/lc-local-backend"),
+            "LETTA_LOCAL_BACKEND_EXPERIMENTAL": "1"}
 
 
 async def _communicate(*cmd: str, env: Mapping[str, str], timeout_s: int) -> tuple[int, bytes, bytes]:
@@ -89,13 +83,7 @@ async def export_session(context_id: str, session_id: str) -> bytes:
     (root / "snapshot-session.json").write_text(json.dumps({"session_id": session_id}))
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        agent_file = root / "agent-id.json"
-        cloud = agent_file.exists() and json.loads(agent_file.read_text()).get("backend") == "cloud"
-        if cloud:
-            for name in ("agent-id.json", "context.json", "snapshot-session.json"):
-                archive.add(root / name, arcname="state/" + name)
-        else:
-            archive.add(root, arcname="state")
+        archive.add(root, arcname="state")
     return buffer.getvalue()
 
 
@@ -317,80 +305,11 @@ async def model_relay(headers: dict[str, str]):
             await runner.cleanup()
 
 
-def _cli(env: Mapping[str, str]) -> list[str]:
-    return ["letta"] if env.get("LETTA_API_KEY") else ["letta", "--backend", "local"]
-
-
-@asynccontextmanager
-async def _provider(env, context_id, model, attribution):
-    if not env.get("LETTA_API_KEY"):
-        async with model_relay(provider_headers(os.environ, attribution)) as relay:
-            await _command(env, "connect", "openai-compatible", "--base-url", relay, "--api-key", "relay")
-            yield "openai-compatible/" + model
-        return
-    # The cloud provider API used by CLI 0.34.25 carries a URL and key, but no arbitrary headers.
-    # Never silently discard endpoint headers (which may themselves be authentication).
-    if model_headers(os.environ.get(MODEL_HEADERS_ENV)):
-        raise ValueError("Letta Cloud BYOK cannot forward [model.headers]; use local mode for this endpoint")
-    base = _base_url(os.environ)
-    if not os.environ.get("LITELLM_BASE_URL"):
-        raise ValueError("Cloud mode requires the task's [model] endpoint")
-    # A provider belongs to a context and endpoint/key combination. Credential rotation gets a new
-    # provider without changing another context's in-flight calls. No raw credential is persisted locally.
-    identity = json.dumps([context_id, base, os.environ.get("LITELLM_API_KEY", "")])
-    name = "agentenv-" + hashlib.sha256(identity.encode()).hexdigest()[:32]
-    async with ClientSession(headers={"Authorization": "Bearer " + env["LETTA_API_KEY"]},
-                             timeout=ClientTimeout(total=_CLI_TIMEOUT_S)) as client:
-        url = env["LETTA_BASE_URL"].rstrip("/") + "/v1/providers"
-        async with client.get(url) as response:
-            response.raise_for_status()
-            providers = await response.json()
-        if not any(provider["name"] == name for provider in providers):
-            async with client.post(url, json={"name": name, "provider_type": "openai", "base_url": base,
-                                               "api_key": os.environ.get("LITELLM_API_KEY", "")}) as response:
-                # A second process may have created the same deterministic provider.
-                if response.status == 409:
-                    async with client.get(url) as retry:
-                        retry.raise_for_status()
-                        if not any(item["name"] == name for item in await retry.json()):
-                            response.raise_for_status()
-                else:
-                    response.raise_for_status()
-    yield name + "/" + model
-
-
 async def _command(env: dict[str, str], *args: str) -> bytes:
-    code, out, err = await _communicate(*_cli(env), *args, env=env, timeout_s=120)
+    code, out, err = await _communicate("letta", "--backend", "local", *args, env=env, timeout_s=120)
     if code:
         raise RuntimeError(f"Letta Code {args[0]} failed: {err.decode(errors='replace')[-ERROR_MESSAGE_LIMIT:]}")
     return out
-
-
-async def _cloud_agent(env, context_id, handle, agent_id=None):
-    """Resolve the context on the server and bind both inference and compaction to BYOK."""
-    base = env["LETTA_BASE_URL"].rstrip("/") + "/v1/agents"
-    name = "agentenv-" + hashlib.sha256(context_id.encode()).hexdigest()[:32]
-    async with ClientSession(headers={"Authorization": "Bearer " + env["LETTA_API_KEY"]},
-                             timeout=ClientTimeout(total=_CLI_TIMEOUT_S)) as client:
-        if not agent_id:
-            async with client.get(base, params={"name": name}) as response:
-                response.raise_for_status()
-                agents = await response.json()
-            if agents:
-                agent_id = agents[0]["id"]
-        config = {"model": handle, "compaction_settings": {"model": handle}}
-        if agent_id:
-            async with client.patch(base + "/" + agent_id, json=config) as response:
-                response.raise_for_status()
-        else:
-            async with client.post(base, json={
-                **config, "name": name, "tags": ["origin:letta-code", "git-memory-enabled"],
-                "include_base_tools": False, "include_base_tool_rules": False,
-                "tools": [], "initial_message_sequence": [],
-            }) as response:
-                response.raise_for_status()
-                agent_id = (await response.json())["id"]
-    return agent_id
 
 
 def _configure_agent(home: Path, agent_id: str, servers: dict, role: str | None, system_prompt: str | None):
@@ -412,16 +331,12 @@ def _configure_agent(home: Path, agent_id: str, servers: dict, role: str | None,
                                            "-m", "Update task instructions", "--", target]):
         subprocess.run(["git", *args], cwd=memory, check=True, capture_output=True)
 
-    _configure_settings(home, agent_id, servers, role)
-
-
-def _configure_settings(home, agent_id, servers, role, base_url=None):
     settings_path = home / ".letta/settings.json"
     settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
     agents = settings.setdefault("agents", [])
     matching = [agent for agent in agents if agent.get("agentId") == agent_id]
     if not matching:
-        matching = [{"agentId": agent_id, "baseUrl": base_url or "local:" + str(home / ".letta/lc-local-backend")}]
+        matching = [{"agentId": agent_id, "baseUrl": "local:" + str(home / ".letta/lc-local-backend")}]
         agents.extend(matching)
     for agent in matching:
         agent["mcpServers"] = [
@@ -445,52 +360,36 @@ async def run_letta_code(
     mcp_servers: dict[str, dict] | None = None, system_prompt: str | None = None,
     output_format: dict | None = None, timeout_s: int = 600, project_id: str | None = None,
     task_id: str | None = None, role: str | None = None, attachment_paths: list[str] | None = None,
-    letta_api_key: str | None = None, letta_base_url: str = "https://api.letta.com",
     effort: str | None = None, event_callback: Callable[[dict], None] | None = None, workspace: str = "/app",
 ) -> LettaCodeResult:
     """A bounded CLI turn, including provider setup; cancellation kills the process tree."""
     try:
         async with asyncio.timeout(timeout_s):
             return await _turn(prompt, context_id, session_id, model, mcp_servers, system_prompt, output_format,
-                               project_id, task_id, role, attachment_paths, effort, event_callback, workspace,
-                               letta_api_key, letta_base_url)
+                               project_id, task_id, role, attachment_paths, effort, event_callback, workspace)
     except TimeoutError:
         return LettaCodeResult(response="", tool_call_count=0, session_id=session_id,
                                error=f"Letta Code timed out after {timeout_s}s")
 
 
 async def _turn(prompt, context_id, session_id, model, mcp_servers, system_prompt, output_format,
-                project_id, task_id, role, attachment_paths, effort, event_callback, workspace,
-                letta_api_key=None, letta_base_url="https://api.letta.com"):
+                project_id, task_id, role, attachment_paths, effort, event_callback, workspace):
     model = model or DEFAULT_MODEL
-    env = _context_env(context_id, letta_api_key, letta_base_url)
+    handle = "openai-compatible/" + model
+    env = _context_env(context_id)
     home = Path(env["HOME"])
     (home / "context.json").write_text(json.dumps({"home": str(home)}))
     attribution = _attribution_headers(project_id, task_id)
-    async with _provider(env, context_id, model, attribution) as handle:
+    async with model_relay(provider_headers(os.environ, attribution)) as relay:
+        await _command(env, "connect", "openai-compatible", "--base-url", relay, "--api-key", "relay")
         agent_file = home / "agent-id.json"
         if agent_file.exists():
-            saved = json.loads(agent_file.read_text())
-            if (saved.get("backend", "local") == "cloud") != bool(letta_api_key):
-                raise ValueError("Context backend differs from the configured backend")
-            if letta_api_key and saved.get("base_url") != letta_base_url:
-                raise ValueError("Cloud snapshot belongs to another Letta base URL")
-            agent_id = saved["id"]
+            agent_id = json.loads(agent_file.read_text())["id"]
         else:
-            agent_id = None
-        if letta_api_key:
-            agent_id = await _cloud_agent(env, context_id, handle, agent_id)
-        elif agent_id is None:
             agent = json.loads(await _command(env, "agents", "create", "--model", handle))
             agent_id = agent["id"]
-        agent_file.write_text(json.dumps({"id": agent_id, "backend": "cloud" if letta_api_key else "local",
-                                          "base_url": letta_base_url if letta_api_key else None}))
-        if letta_api_key:
-            _configure_settings(home, agent_id, mcp_servers or {}, role, letta_base_url)
-            if system_prompt:
-                prompt = system_prompt + "\n\n" + prompt
-        else:
-            _configure_agent(home, agent_id, mcp_servers or {}, role, system_prompt)
+            agent_file.write_text(json.dumps({"id": agent_id}))
+        _configure_agent(home, agent_id, mcp_servers or {}, role, system_prompt)
         tools = json.loads(await _command(env, "mcp", "tools", "--full", "--agent", agent_id)) if mcp_servers else []
         _install_mcp_tools(home, agent_id, tools)
         skills = Path(os.environ.get("HOME", "/data")) / ".letta/skills"
@@ -503,7 +402,7 @@ async def _turn(prompt, context_id, session_id, model, mcp_servers, system_promp
             prompt += "\nReturn only JSON matching this schema: " + json.dumps(schema)
         for path in attachment_paths or []:
             prompt += "\nRead the attached file at " + path
-        cmd = [*_cli(env), "-p", prompt, "--output-format", "stream-json", "--yolo",
+        cmd = ["letta", "--backend", "local", "-p", prompt, "--output-format", "stream-json", "--yolo",
                "--model", handle, "--toolset", "default"]
         cmd += ["--conversation", session_id] if session_id else ["--agent", agent_id, "--new"]
         if effort:
@@ -515,11 +414,7 @@ async def _turn(prompt, context_id, session_id, model, mcp_servers, system_promp
         ))
         _RUNNING.add(proc)
         parser = _EventParser(event_callback)
-        if not letta_api_key:
-            _record_attribution(project_id, task_id)
-        else:
-            with _attribution_lock:
-                _last_attribution.update(project_id=None, task_id=None, last_seen_at_utc=None)
+        _record_attribution(project_id, task_id)
         try:
             stderr = await _stream_cli(proc, parser.on_line)
         except BaseException:

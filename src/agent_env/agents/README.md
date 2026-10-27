@@ -62,11 +62,10 @@ OpenAI-compatible one, `<base>/v1/chat/completions`, and takes its model from th
 with glibc. Its folder's `README.md` covers the extensions it implements.
 
 `agents/letta-code/` runs [Letta Code](https://github.com/letta-ai/letta-code) behind the protocol's A2A agent
-framework: each turn runs the CLI in headless mode, resumed in the context's conversation. Local mode keeps separate agent state per context; an optional secret-backed agent-config key
-selects Letta Cloud with persistent server-side memory. Name it as `letta-code`, its alias, or by its id,
+framework: each turn is one `letta --backend local -p --output-format stream-json` run, resumed in the context's
+conversation, with a separate local agent and memory per context. Name it as `letta-code`, its alias, or by its id,
 `@local/agentenv-framework/agents/letta-code`. It calls the `[model]` endpoint as an OpenAI-compatible one through
-a local relay that adds task attribution, or a cloud BYOK provider with the header limitations documented in
-its README, and takes its model from the prompt, else `openai/gpt-4.1-mini`. It declares
+a relay that adds task attribution, and takes its model from the prompt, else `openai/gpt-4.1-mini`. It declares
 `install/v1` too, into a container or onto a Linux host with glibc. Its folder's `README.md` covers the extensions
 it implements. Run its smoke task with `agent-env run agents --task letta-code-smoke`.
 

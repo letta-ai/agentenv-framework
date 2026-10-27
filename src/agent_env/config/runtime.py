@@ -96,16 +96,12 @@ def _validated_a2a_agent_id(value: object, source: str) -> str:
 
 def validated_agents_section(section: Mapping[str, Any]) -> Mapping[str, Any]:
     """The ``[agents]`` table, checked as the reader checks it; ``config show`` runs this too."""
-    unknown = set(section) - {_AGENTS_CONFIG_KEY, "config"}
+    unknown = set(section) - {_AGENTS_CONFIG_KEY}
     if unknown:
         raise ConfigError(
             f"[{_AGENTS_CONFIG_SECTION}] has unknown keys {sorted(unknown)}; "
-            f"allowed: ['{_AGENTS_CONFIG_KEY}', 'config']"
+            f"allowed: ['{_AGENTS_CONFIG_KEY}']"
         )
-    if not isinstance(section.get("config", {}), dict):
-        raise ConfigError("[agents.config] must be a table keyed by deployed agent name")
-    if any(not isinstance(fields, dict) for fields in section.get("config", {}).values()):
-        raise ConfigError("Each [agents.config.<agent-name>] must be a table of agent-config fields")
     if _AGENTS_CONFIG_KEY in section:
         _validated_a2a_agent_id(
             section[_AGENTS_CONFIG_KEY], f"[{_AGENTS_CONFIG_SECTION}] {_AGENTS_CONFIG_KEY}"
@@ -387,11 +383,6 @@ class Config:
             resolved = config_loader.interpolate(layer.raw, secret_resolver=self._resolve_secret)
             return _validated_human_a2a_url(resolved, key.file_label)
         raise ConfigError(f"No human-A2A URL configured: set [{_HUMAN_A2A_CONFIG_SECTION}] {_HUMAN_A2A_CONFIG_KEY} or AGENT_ENV_HUMAN_A2A_URL")
-
-    def get_agent_config(self, agent_name: str) -> dict[str, Any]:
-        """Negotiated extension fields for a deployed name, with secret references resolved."""
-        section = validated_agents_section(self.section(_AGENTS_CONFIG_SECTION))
-        return self.resolve_reference(section.get("config", {}).get(agent_name, {}))
 
     def get_default_a2a_agent_id(self) -> str:
         """The agent a ``deploy_agent`` step without an id deploys:
