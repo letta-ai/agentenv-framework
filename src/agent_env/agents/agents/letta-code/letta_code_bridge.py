@@ -4,40 +4,38 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
-import io
 import shutil
-import tarfile
-import tempfile
 import signal
 import subprocess
+import tarfile
+import tempfile
 import threading
-from contextlib import asynccontextmanager
-
-from aiohttp import ClientSession, ClientTimeout, web
-
 from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from aiohttp import ClientSession, ClientTimeout, web
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 logger = logging.getLogger(__name__)
 
 # The model a run uses when neither the task nor the agent-config names one; the
-# @ai-sdk/openai-compatible provider forwards it verbatim as the chat model.
-DEFAULT_MODEL = os.environ.get("LETTA_CODE_MODEL", "openai/gpt-4.1-mini")
+# local backend forwards it verbatim as the chat model.
+DEFAULT_MODEL = "openai/gpt-4.1-mini"
 ERROR_MESSAGE_LIMIT = 4000
 ROLE_HEADER = "AgentEnv-Role"
 # What agent-env gives an agent for [model.headers]: a JSON object of header names to values.
 MODEL_HEADERS_ENV = "LITELLM_EXTRA_HEADERS"
 
-# Root under which each A2A context_id gets its own OpenCode data dir; lives
+# Root under which each A2A context_id gets its own Letta Code data dir; lives
 # under $HOME so host-mode instances don't share session state.
-SESSIONS_ROOT = os.environ.get("LETTA_CODE_SESSIONS_ROOT") or os.path.join(os.environ.get("HOME", "/data"), "sessions")
+SESSIONS_ROOT = os.path.join(os.environ.get("HOME", "/data"), "sessions")
 _CLI_TIMEOUT_S = 120
 
 
@@ -48,7 +46,7 @@ def _base_url(environ: Mapping[str, str]) -> str:
 
 
 def context_data_dir(context_id: str) -> Path:
-    """Per-context OpenCode data dir. A stable short hash keeps the path clean
+    """Per-context Letta Code data dir. A stable short hash keeps the path clean
     and filesystem-safe regardless of the context_id's charset."""
     ctx_hash = hashlib.sha1(context_id.encode()).hexdigest()[:16]
     return Path(SESSIONS_ROOT) / ctx_hash
@@ -58,21 +56,23 @@ def _context_env(context_id: str) -> dict[str, str]:
     home = context_data_dir(context_id)
     home.mkdir(parents=True, exist_ok=True)
     return {**os.environ, "HOME": str(home), "LETTA_LOCAL_BACKEND_DIR": str(home / ".letta/lc-local-backend"),
-            "LETTA_LOCAL_BACKEND_EXPERIMENTAL": "1", "LETTA_CODE_DISABLE_AUTOUPDATE": "1"}
+            "LETTA_LOCAL_BACKEND_EXPERIMENTAL": "1"}
 
 
 async def _communicate(*cmd: str, env: Mapping[str, str], timeout_s: int) -> tuple[int, bytes, bytes]:
     """Run a short CLI command to its end; one that outlives ``timeout_s`` is killed."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=dict(env),
-    )
+    proc = await _started(asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=dict(env), start_new_session=True,
+    ))
+    _RUNNING.add(proc)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
+        _kill_cli(proc)
+        await _reap(proc)
         raise
+    finally:
+        _RUNNING.discard(proc)
     return proc.returncode, out, err
 
 
@@ -317,7 +317,7 @@ def _configure_agent(home: Path, agent_id: str, servers: dict, role: str | None,
     instructions = system_prompt or ""
     if servers:
         instructions += ("\nMCP tools are available through the Letta CLI. Before calling any MCP tool, run "
-                         "`letta mcp tools --agent " + agent_id + "` to discover exact names and schemas. "
+                         "`letta mcp tools --full --agent " + agent_id + "` to discover exact names and schemas. "
                          "Use the full mcp__<server>__<tool> name returned by discovery, never a bare tool name. "
                          "Call `letta mcp call <full-name> --agent " + agent_id + " --args '<JSON>'`. "
                          "Use these tools to act on connected services and peer agents.\n")
@@ -394,10 +394,11 @@ async def _turn(prompt, context_id, session_id, model, mcp_servers, system_promp
         for path in attachment_paths or []:
             prompt += "\nRead the attached file at " + path
         cmd = ["letta", "--backend", "local", "-p", prompt, "--output-format", "stream-json", "--yolo",
-               "--model", handle, "--agent", agent_id, "--toolset", "default"]
-        cmd += ["--conversation", session_id] if session_id else ["--new"]
+               "--model", handle, "--toolset", "default"]
+        cmd += ["--conversation", session_id] if session_id else ["--agent", agent_id, "--new"]
         if effort:
-            cmd += ["--reasoning", effort]
+            target = ["--conversation", session_id] if session_id else ["--agent", agent_id]
+            await _command(env, "model", "set", handle, "--reasoning", effort, *target)
         proc = await _started(asyncio.create_subprocess_exec(
             *cmd, cwd=workspace, env=env, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,

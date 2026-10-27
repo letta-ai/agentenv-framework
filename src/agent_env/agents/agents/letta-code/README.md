@@ -7,7 +7,7 @@ is the whole build context. The Dockerfile pins the Python base by digest and No
 
 Each turn runs `letta --backend local -p --output-format stream-json --yolo`. The bridge creates an agent with
 `letta agents create`; the first turn uses `--agent <id> --new`, and subsequent turns use
-`--agent <id> --conversation <id>`. Each context has a separate home under `$HOME/sessions/`. Different contexts
+`--conversation <id>`. Each context has a separate home under `$HOME/sessions/`. Different contexts
 run concurrently; turns in one context and snapshot operations are synchronized.
 
 The bridge connects the local backend with `letta connect openai-compatible`. A per-turn loopback relay forwards
