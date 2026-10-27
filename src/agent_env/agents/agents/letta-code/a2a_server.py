@@ -10,6 +10,7 @@ session, which later turns resume with `--conversation <id>`.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import base64
 import binascii
 import json
@@ -66,11 +67,13 @@ from starlette.exceptions import HTTPException
 
 from letta_code_bridge import (
     ERROR_MESSAGE_LIMIT,
+    commit_staged_session,
     event_session_id,
     export_session,
     get_last_attribution_snapshot,
-    import_session,
     kill_running_clis,
+    shielded_thread,
+    stage_session,
     run_letta_code,
     validate_output_format,
 )
@@ -447,11 +450,23 @@ class LettaCodeAgent(DurableSessionRefs, AgentEnvAgent):
                     check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 )
             async with self._workspace.exclusive(), self._turn_lock(target_context_id):
-                imported_session_id = await import_session(target_context_id, str(session_file))
+                # Stage the conversation first, so a bad snapshot changes nothing. The workspace swap and the
+                # conversation swap then run in one thread that cancellation can't abandon: a failed conversation
+                # swap puts /app back, and the context's previous conversation stays in place until both succeed.
+                session_dir = Path(directory) / "session"
+                session_dir.mkdir()
+                imported_session_id, staged_session = await shielded_thread(
+                    stage_session, target_context_id, str(session_file), str(session_dir))
                 if not imported_session_id:
                     raise HTTPException(status_code=500, detail="Letta Code import returned no session id")
+
+                def commit_session() -> None:
+                    commit_staged_session(target_context_id, staged_session)
+
                 if staged is not None:
-                    await asyncio.to_thread(_replace_workspace, staged)
+                    await shielded_thread(_replace_workspace, staged, commit_session)
+                else:
+                    await shielded_thread(commit_session)
                 self.set_session_ref_for_context(target_context_id, imported_session_id)
         return {"context_id": target_context_id}
 
@@ -521,12 +536,25 @@ class LettaCodeChangelogAgent(LettaCodeAgent):
         return {"count": len(request.increments), "context_id": request.target_context_id}
 
 
-def _replace_workspace(staged: Path) -> None:
+def _replace_workspace(staged: Path, then: Callable[[], None] | None = None) -> None:
+    """Swap staged in for /app's contents. When then() raises after the swap, /app's previous contents come back."""
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     backup = Path(tempfile.mkdtemp(prefix=".letta_code-backup-", dir=WORKSPACE_DIR))
     saved = backup / "saved"
     saved.mkdir()
     committed = False
+
+    def restore_saved() -> None:
+        for child in WORKSPACE_DIR.iterdir():
+            if child == backup:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        for child in saved.iterdir():
+            child.rename(WORKSPACE_DIR / child.name)
+
     try:
         try:
             for child in WORKSPACE_DIR.iterdir():
@@ -539,17 +567,11 @@ def _replace_workspace(staged: Path) -> None:
         try:
             for child in staged.iterdir():
                 shutil.move(str(child), str(WORKSPACE_DIR / child.name))
+            if then is not None:
+                then()
             committed = True
         except Exception:
-            for child in WORKSPACE_DIR.iterdir():
-                if child == backup:
-                    continue
-                if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
-            for child in saved.iterdir():
-                child.rename(WORKSPACE_DIR / child.name)
+            restore_saved()
             raise
     finally:
         if committed:

@@ -1,9 +1,9 @@
 FROM public.ecr.aws/docker/library/python:3.11-slim@sha256:c20888b6acdd1e63e1c433a185bf3ad162c0288fe484616ce062e0d28add2900
 # Node to install the Letta Code CLI, a native binary, and for the model's commands, checked against its published
 # checksum; install.sh brings the same. poppler-utils renders a PDF attachment to the page images the model reads.
-ARG NODE_VERSION=22.23.3
-ARG NODE_SHA256_X64=1084aa36196bba4c3a5e69a1ee388a6e4ff729dad09445fbcd434b28fe3c24af
-ARG NODE_SHA256_ARM64=5ced2d48d1d7198739b7f86804de0171aefb6823b684b12341d3321afc3cb0b2
+ARG NODE_VERSION=22.23.4
+ARG NODE_SHA256_X64=b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406
+ARG NODE_SHA256_ARM64=f7a1e486dbc8b286847815b477d4fb5e9fb963ed4489c3e1588853d685f589f9
 RUN set -eu; \
     apt-get update && apt-get install -y --no-install-recommends ca-certificates curl poppler-utils git \
       && rm -rf /var/lib/apt/lists/*; \

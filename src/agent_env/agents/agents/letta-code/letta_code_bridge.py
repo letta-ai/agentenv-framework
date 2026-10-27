@@ -37,6 +37,8 @@ MODEL_HEADERS_ENV = "LITELLM_EXTRA_HEADERS"
 # under $HOME so host-mode instances don't share session state.
 SESSIONS_ROOT = os.path.join(os.environ.get("HOME", "/data"), "sessions")
 _CLI_TIMEOUT_S = 120
+# Largest model request body the relay accepts from the CLI.
+_RELAY_MAX_REQUEST_BYTES = 100 * 1024**2
 
 
 def _base_url(environ: Mapping[str, str]) -> str:
@@ -77,8 +79,7 @@ async def _communicate(*cmd: str, env: Mapping[str, str], timeout_s: int) -> tup
 
 
 
-async def export_session(context_id: str, session_id: str) -> bytes:
-    """Capture the conversation, agent, git-backed memory and local settings together."""
+def _archive_session(context_id: str, session_id: str) -> bytes:
     root = context_data_dir(context_id)
     (root / "snapshot-session.json").write_text(json.dumps({"session_id": session_id}))
     buffer = io.BytesIO()
@@ -87,25 +88,67 @@ async def export_session(context_id: str, session_id: str) -> bytes:
     return buffer.getvalue()
 
 
+async def export_session(context_id: str, session_id: str) -> bytes:
+    """Capture the conversation, agent, git-backed memory and local settings together, off the event loop."""
+    return await shielded_thread(_archive_session, context_id, session_id)
+
+
+async def shielded_thread(func, *args):
+    """Run blocking file work in a thread that cancellation can't abandon: a cancelled caller still waits for it."""
+    task = asyncio.ensure_future(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with contextlib.suppress(BaseException):
+            await task
+        raise
+
+
+def stage_session(context_id: str, json_path: str, directory: str) -> tuple[str, Path]:
+    """Extract a snapshot's local state into directory, with paths rewritten for context_id; the target is untouched."""
+    root = context_data_dir(context_id)
+    with tarfile.open(json_path, "r:gz") as archive:
+        archive.extractall(directory, filter="data")
+    staged = Path(directory) / "state"
+    session_id = json.loads((staged / "snapshot-session.json").read_text())["session_id"]
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("Snapshot has no conversation id")
+    # Memory repos and settings may contain absolute paths to the original context.
+    source = json.loads((staged / "context.json").read_text())["home"]
+    for path in staged.rglob("*.json"):
+        if ".git" not in path.parts:
+            path.write_text(path.read_text().replace(source, str(root)))
+    return session_id, staged
+
+
+def commit_staged_session(context_id: str, staged: Path) -> None:
+    """Swap a staged state tree in for the context's; the previous tree is restored if the move fails."""
+    root = context_data_dir(context_id)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    previous = root.with_name(root.name + ".previous")
+    if previous.exists():
+        shutil.rmtree(previous)
+    if root.exists():
+        root.rename(previous)
+    try:
+        shutil.move(str(staged), root)
+    except BaseException:
+        if root.exists():
+            shutil.rmtree(root)
+        if previous.exists():
+            previous.rename(root)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous)
+
+
 async def import_session(context_id: str, json_path: str) -> str:
     """Stage a complete local state tree, then replace the target context's state."""
     root = context_data_dir(context_id)
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root.parent) as directory:
-        with tarfile.open(json_path, "r:gz") as archive:
-            archive.extractall(directory, filter="data")
-        staged = Path(directory) / "state"
-        session_id = json.loads((staged / "snapshot-session.json").read_text())["session_id"]
-        if not isinstance(session_id, str) or not session_id:
-            raise ValueError("Snapshot has no conversation id")
-        # Memory repos and settings may contain absolute paths to the original context.
-        source = json.loads((staged / "context.json").read_text())["home"]
-        for path in staged.rglob("*.json"):
-            if ".git" not in path.parts:
-                path.write_text(path.read_text().replace(source, str(root)))
-        if root.exists():
-            shutil.rmtree(root)
-        shutil.move(str(staged), root)
+        session_id, staged = await shielded_thread(stage_session, context_id, json_path, directory)
+        await shielded_thread(commit_staged_session, context_id, staged)
     return session_id
 
 
@@ -271,11 +314,13 @@ def _descendants(pid: int) -> list[int]:
 
 
 @asynccontextmanager
-async def model_relay(headers: dict[str, str]):
+async def model_relay(headers: dict[str, str], on_forward=None):
     """Keep endpoint credentials and task attribution on requests to the configured model endpoint only."""
     base = _base_url(os.environ)
     async with ClientSession(timeout=ClientTimeout(total=None), auto_decompress=False) as client:
         async def forward(request):
+            if on_forward is not None:
+                on_forward()
             outgoing = {"authorization": "Bearer " + os.environ.get("LITELLM_API_KEY", ""), **headers}
             if request.content_type:
                 outgoing["content-type"] = request.headers.get("Content-Type", "application/json")
@@ -292,7 +337,7 @@ async def model_relay(headers: dict[str, str]):
                         await response.write(chunk)
                     await response.write_eof()
                 return response
-        app = web.Application(client_max_size=100 * 1024**2)
+        app = web.Application(client_max_size=_RELAY_MAX_REQUEST_BYTES)
         app.router.add_route("*", "/{path:.*}", forward)
         runner = web.AppRunner(app)
         await runner.setup()
@@ -306,7 +351,7 @@ async def model_relay(headers: dict[str, str]):
 
 
 async def _command(env: dict[str, str], *args: str) -> bytes:
-    code, out, err = await _communicate("letta", "--backend", "local", *args, env=env, timeout_s=120)
+    code, out, err = await _communicate("letta", "--backend", "local", *args, env=env, timeout_s=_CLI_TIMEOUT_S)
     if code:
         raise RuntimeError(f"Letta Code {args[0]} failed: {err.decode(errors='replace')[-ERROR_MESSAGE_LIMIT:]}")
     return out
@@ -380,7 +425,8 @@ async def _turn(prompt, context_id, session_id, model, mcp_servers, system_promp
     home = Path(env["HOME"])
     (home / "context.json").write_text(json.dumps({"home": str(home)}))
     attribution = _attribution_headers(project_id, task_id)
-    async with model_relay(provider_headers(os.environ, attribution)) as relay:
+    async with model_relay(provider_headers(os.environ, attribution),
+                           on_forward=lambda: _record_attribution(project_id, task_id)) as relay:
         await _command(env, "connect", "openai-compatible", "--base-url", relay, "--api-key", "relay")
         agent_file = home / "agent-id.json"
         if agent_file.exists():
@@ -414,7 +460,6 @@ async def _turn(prompt, context_id, session_id, model, mcp_servers, system_promp
         ))
         _RUNNING.add(proc)
         parser = _EventParser(event_callback)
-        _record_attribution(project_id, task_id)
         try:
             stderr = await _stream_cli(proc, parser.on_line)
         except BaseException:

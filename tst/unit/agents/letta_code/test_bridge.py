@@ -97,7 +97,7 @@ async def test_cancel_kills_the_turn_process(monkeypatch, tmp_path, session_id):
             return self.returncode
 
     @asynccontextmanager
-    async def relay(*args):
+    async def relay(*args, **kwargs):
         yield "http://relay/v1"
 
     monkeypatch.setattr(bridge, "model_relay", relay)
@@ -130,3 +130,100 @@ def test_direct_mcp_catalog_replaces_previous_context_tools(tmp_path):
     assert (tmp_path / ".letta/mods/agentenv-mcp.ts").exists()
     bridge._install_mcp_tools(tmp_path, "agent-local-1", [])
     assert json.loads(catalog.read_text())["tools"] == []
+
+
+def test_failed_workspace_swap_keeps_the_previous_conversation(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setattr(a2a_server, "WORKSPACE_DIR", tmp_path / "app")
+    target = bridge.context_data_dir("target")
+    target.mkdir(parents=True)
+    (target / "conversation.json").write_text("previous")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "kept.txt").write_text("previous workspace")
+    staged_state = tmp_path / "staged-state"
+    staged_state.mkdir()
+    (staged_state / "conversation.json").write_text("restored")
+    staged_workspace = tmp_path / "staged-workspace"
+    staged_workspace.mkdir()
+    (staged_workspace / "new.txt").write_text("restored workspace")
+
+    def broken_move(*args, **kwargs):
+        if str(args[0]) == str(staged_state):
+            raise OSError("conversation move failed")
+        return real_move(*args, **kwargs)
+
+    real_move = bridge.shutil.move
+    monkeypatch.setattr(bridge.shutil, "move", broken_move)
+    with pytest.raises(OSError):
+        a2a_server._replace_workspace(staged_workspace, lambda: bridge.commit_staged_session("target", staged_state))
+    assert (tmp_path / "app" / "kept.txt").read_text() == "previous workspace"
+    assert not (tmp_path / "app" / "new.txt").exists()
+    assert (target / "conversation.json").read_text() == "previous"
+
+
+def test_commit_staged_session_restores_previous_state_when_the_move_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "SESSIONS_ROOT", str(tmp_path / "sessions"))
+    target = bridge.context_data_dir("target")
+    target.mkdir(parents=True)
+    (target / "conversation.json").write_text("previous")
+    staged = tmp_path / "staged"
+    staged.mkdir()
+
+    def broken_move(*args, **kwargs):
+        raise OSError("move failed")
+
+    monkeypatch.setattr(bridge.shutil, "move", broken_move)
+    with pytest.raises(OSError):
+        bridge.commit_staged_session("target", staged)
+    assert (target / "conversation.json").read_text() == "previous"
+    assert not target.with_name(target.name + ".previous").exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_caller_waits_for_the_file_thread():
+    finished = []
+    release = __import__("threading").Event()
+
+    def work():
+        release.wait(5)
+        finished.append(True)
+
+    task = asyncio.create_task(bridge.shielded_thread(work))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished == [True]
+
+
+@pytest.mark.asyncio
+async def test_attribution_is_recorded_only_when_the_relay_forwards(monkeypatch):
+    monkeypatch.setitem(bridge._last_attribution, "project_id", None)
+    monkeypatch.setitem(bridge._last_attribution, "task_id", None)
+    seen = []
+
+    @asynccontextmanager
+    async def relay(headers, on_forward=None):
+        seen.append(on_forward)
+        yield "http://relay/v1"
+
+    monkeypatch.setattr(bridge, "model_relay", relay)
+
+    async def command(*args, **kwargs):
+        return b'{"id":"agent-local-1"}'
+
+    async def spawn(*args, **kwargs):
+        raise OSError("cli did not start")
+
+    monkeypatch.setattr(bridge, "_command", command)
+    monkeypatch.setattr(bridge, "_configure_agent", lambda *args: None)
+    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(OSError):
+        await bridge.run_letta_code("hi", "ctx-attr", project_id="p1", task_id="t1", workspace="/tmp")
+    assert bridge.get_last_attribution_snapshot()["project_id"] is None
+    seen[0]()
+    snapshot = bridge.get_last_attribution_snapshot()
+    assert snapshot["project_id"] == "p1" and snapshot["task_id"] == "t1"
