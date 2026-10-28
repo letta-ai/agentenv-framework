@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentenv-framework"
-version = "0.9.1363"
+version = "0.9.1371"
 description = "SDK and CLI for building, deploying and running agent environments and the tasks that grade agents in them."
 readme = "README.md"
 license = "Apache-2.0"
@@ -46,10 +46,14 @@ dependencies = [
     "uvicorn>=0.47",  # 0.47 adds ssl_context_factory, how the local grant server gets its TLS context
     "modal>=1.5.2.dev22",  # dev22 adds _experimental_create(tags=); dev2 added VM-mode V2 (vm_runtime)
     "e2b~=2.46.4",  # AsyncSandbox/AsyncTemplate APIs validated against the 2.46 line
-    "openenv>=0.9,<0.11",  # serves bundle tasks as OpenEnv envs; the range spans OpenEnv's two-minor deprecation window
+    "fastapi>=0.110",  # the explorer, agent-env up
 ]
 
 [project.optional-dependencies]
+# agent_env.openenv: bundle tasks served as OpenEnv envs. No cap: OpenEnv ships a minor release a week.
+openenv = [
+    "openenv>=0.9",
+]
 # The AWS store backends (S3, Secrets Manager, DynamoDB, ECR), selected by impl pointer in config.toml.
 aws = [
     "boto3>=1.35.0",
@@ -89,9 +93,10 @@ daytona = [
     "daytona~=0.224.0",  # AsyncDaytona sandboxes, sessions, file API, preview links and egress lists validated against 0.224
 ]
 dev = [
-    "agentenv-framework[aws,boxd,daytona,gcp,sail,tensorlake,tenki,vercel]",  # exercise portable optional providers and stores in CI
+    "agentenv-framework[aws,boxd,daytona,gcp,openenv,sail,tensorlake,tenki,vercel]",  # exercise portable optional providers and stores in CI
     "fastmcp>=3.4,<4",  # the standalone-fastmcp mount path of the protocol; <4 keeps mcp 1.x
     "Pillow>=10.4",  # the protocol's computer extra, whose tests the unit tier runs
+    "av>=17",  # the protocol's computer extra, whose tests the unit tier runs and which the recording tests decode with
     "griffelib==2.3.0",  # the plugin API check; exact, since what it reports as a break changes between releases
     "tomli-w==1.2.0",  # the Codex agent's config writer, which only its image installs; its tests import it
     "moto>=5.0.0",
@@ -113,10 +118,12 @@ agent-env = "agent_env.cli:cli"
 
 [project.entry-points."agent_env.bundles"]
 agents = "agent_env"
+computers = "agent_env"
 drivers = "agent_env"
 hello = "agent_env.examples"
 echo-mcp = "agent_env.examples"
 mail-mcp = "agent_env.examples"
+next-env-event = "agent_env.examples"
 
 [project.urls]
 Homepage = "https://www.agentenvframework.com"
