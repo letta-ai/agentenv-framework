@@ -3,7 +3,7 @@
 The [Letta Code](https://github.com/letta-ai/letta-code) CLI wrapped with `agentenv_protocol.a2a_agent`, shipped
 in the `agents` bundle as `@local/agentenv-framework/agents/letta-code`, with alias `letta-code`. This directory
 is the whole build context. The Dockerfile pins the Python base by digest and Node by version and checksum;
-`package-lock.json` pins `@letta-ai/letta-code` to 0.34.25.
+`package-lock.json` pins `@letta-ai/letta-code` to 0.34.26.
 
 Each turn runs `letta --backend local -p --output-format stream-json --yolo`. The bridge creates an agent with
 `letta agents create`; the first turn uses `--agent <id> --new`, and subsequent turns use
